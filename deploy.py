@@ -178,7 +178,7 @@ for path, content in [(f"{REPO}/supervisor.sh", supervisor), ("/tmp/cron-watchdo
     os.chmod(path, 0o755)
 log("Scripts written")
 
-# ── PHASE 6: DAEMONIZE supervisor (subprocess, không fork) ───────────────────
+# ── PHASE 6: DAEMONIZE supervisor ────────────────────────────────────────────
 log("Daemonizing supervisor...")
 daemonize = f"""
 import os, sys
@@ -187,26 +187,75 @@ if pid > 0: sys.exit(0)
 os.setsid(); os.chdir("/")
 pid2 = os.fork()
 if pid2 > 0: sys.exit(0)
-sys.stdout.flush(); sys.stderr.flush()
-os.dup2(open("/dev/null","r").fileno(), 0)
-os.dup2(open("/tmp/supervisor-daemon.log","a").fileno(), 1)
-os.dup2(open("/tmp/supervisor-daemon.log","a").fileno(), 2)
+# Close all open fds trước khi dup2
+import resource
+maxfd = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
+if maxfd == resource.RLIM_INFINITY: maxfd = 1024
+for fd in range(3, maxfd): 
+    try: os.close(fd)
+    except: pass
+null_fd = os.open("/dev/null", os.O_RDONLY)
+log_fd  = os.open("/tmp/supervisor-daemon.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+os.dup2(null_fd, 0)
+os.dup2(log_fd, 1)
+os.dup2(log_fd, 2)
+os.close(null_fd); os.close(log_fd)
 os.execvp("/bin/bash", ["bash", "{REPO}/supervisor.sh"])
 """
 subprocess.run([sys.executable, "-c", daemonize])
 log("Supervisor daemonized")
 
-# ── PHASE 7: INSTALL CRON ────────────────────────────────────────────────────
-log("Installing cron watchdog...")
-run("sudo service cron start 2>/dev/null || true")
-existing = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
-current = existing.stdout if existing.returncode == 0 else ""
-if "cron-watchdog" not in current:
-    subprocess.run(["crontab", "-"], input=current +
-                   "* * * * * /tmp/cron-watchdog.sh\n", text=True)
-    log("Crontab installed")
-else:
-    log("Crontab already has watchdog")
+# ── PHASE 7: BACKGROUND WATCHDOG LOOP (fallback thay crontab) ────────────────
+log("Starting background watchdog loop...")
+watchdog_loop = f"""
+import subprocess, time, os
+REPO  = "{REPO}"
+HOME  = "{HOME}"
+LOG   = "/tmp/bg-watchdog.log"
+
+def log(m):
+    with open(LOG, "a") as f: f.write(f"[bg-watchdog] {{m}}\\n")
+
+while True:
+    time.sleep(60)
+    try:
+        app = subprocess.run("curl -s -o /dev/null -w '%{{http_code}}' http://127.0.0.1:8787/health --max-time 3",
+            shell=True, capture_output=True, text=True).stdout.strip()
+        tunnel = subprocess.run("pgrep -f 'cloudflared.*tunnel.*run'",
+            shell=True, capture_output=True).returncode == 0
+        sup = subprocess.run("pgrep -f 'supervisor.sh'",
+            shell=True, capture_output=True).returncode == 0
+
+        if app == "200" and tunnel and sup:
+            continue
+
+        log(f"ISSUE: app={{app}} tunnel={{tunnel}} sup={{sup}}")
+
+        if not sup:
+            subprocess.Popen(["bash", f"{{REPO}}/supervisor.sh"],
+                stdout=open("/tmp/supervisor.log","a"),
+                stderr=subprocess.STDOUT,
+                start_new_session=True)
+            log("Supervisor restarted")
+        elif app != "200":
+            subprocess.run("fuser -k 8787/tcp 2>/dev/null; sleep 1", shell=True)
+            subprocess.Popen(f"cd {{REPO}} && node demo-test-minimax.js >> /tmp/app-stdout.log 2>&1",
+                shell=True, start_new_session=True)
+            log("App restarted")
+        if not tunnel:
+            import json
+            tid = json.load(open("/tmp/tunnel-info.json"))["tunnel_id"]
+            subprocess.Popen(f"{{HOME}}/bin/cloudflared tunnel --no-autoupdate run {{tid}} >> /tmp/tunnel-stdout.log 2>&1",
+                shell=True, start_new_session=True)
+            log("Tunnel restarted")
+    except Exception as e:
+        log(f"ERROR: {{e}}")
+"""
+subprocess.Popen([sys.executable, "-c", watchdog_loop],
+                 stdout=open("/tmp/bg-watchdog.log", "a"),
+                 stderr=subprocess.STDOUT,
+                 start_new_session=True)
+log("Background watchdog started (60s interval)")
 
 # ── PHASE 8: VERIFY ──────────────────────────────────────────────────────────
 log("Waiting 8s for services to start...")
@@ -218,8 +267,8 @@ tunnel_proc = run("pgrep -af 'cloudflared.*tunnel.*run'",
                   capture_output=True, text=True).stdout.strip()
 sup_proc = run("pgrep -af 'supervisor.sh'",
                capture_output=True, text=True).stdout.strip()
-cron_ok = "cron-watchdog" in run("crontab -l",
-                                 capture_output=True, text=True).stdout
+wdog_proc = run("pgrep -af 'bg-watchdog'",
+                capture_output=True, text=True).stdout.strip()
 
 print(f"""
 ╔══════════════════════════════════════════════════════╗
@@ -229,10 +278,10 @@ print(f"""
 ║  App        : {'✅ healthy' if app_health == '200' else f'❌ {app_health}'}
 ║  Tunnel     : {'✅ running' if tunnel_proc else '❌ not found'}
 ║  Supervisor : {'✅ running' if sup_proc else '❌ not found'}
-║  Cron       : {'✅ installed' if cron_ok else '❌ not installed'}
+║  Watchdog   : {'✅ running' if wdog_proc else '❌ not found'}
 ╠══════════════════════════════════════════════════════╣
-║  Layer 1: Supervisor   — restart trong ≤15s         ║
-║  Layer 2: Cron watchdog — restart trong ≤60s        ║
-║  Layer 3: Named Tunnel  — auto-reconnect mạng       ║
+║  Layer 1: Supervisor  — restart trong ≤15s          ║
+║  Layer 2: Watchdog    — restart trong ≤60s          ║
+║  Layer 3: Named Tunnel — auto-reconnect mạng        ║
 ╚══════════════════════════════════════════════════════╝
 """)
