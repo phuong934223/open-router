@@ -13,8 +13,7 @@ API = "https://api.cloudflare.com/client/v4"
 ACCOUNT = "c975a170b2d36879909df9d341a79d9d"
 ZONE = "e234f8e868d45b7803f3823be7fbe2dd"
 DOMAIN = "applevt.com"
-TOKEN = os.environ.get(
-    "CF_API_TOKEN", "cfut_le4t4kUnydGPnbsAdF3WtK4qLOcTRjmbFqxM0Trtbbb1af3c")
+TOKEN = "cfut_le4t4kUnydGPnbsAdF3WtK4qLOcTRjmbFqxM0Trtbbb1af3c"
 HEADERS = {"Authorization": f"Bearer {TOKEN}",
            "Content-Type": "application/json"}
 HOME = os.path.expanduser("~")
